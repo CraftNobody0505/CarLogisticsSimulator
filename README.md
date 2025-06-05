@@ -1,4 +1,4 @@
-![image](https://github.com/user-attachments/assets/b36def53-f4ef-4635-9108-3d6ef90414f6)# 📦 基于强化学习的智能汽车物流调度模拟器 (Car Logistics RL Environment)
+#📦 基于强化学习的智能汽车物流调度模拟器 (Car Logistics RL Environment)
 
 ## 🌟 项目简介
 
