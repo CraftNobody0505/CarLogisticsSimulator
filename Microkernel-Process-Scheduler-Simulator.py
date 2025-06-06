@@ -1,807 +1,554 @@
-import os
-import random
-import time
-from typing import Dict, List, Tuple, Any
-
-import gymnasium as gym
 import numpy as np
-import pandas as pd
+import gymnasium as gym
 from gymnasium import spaces
+import random
+import os
+import time
+import pandas as pd
+import multiprocessing  # 用于获取CPU核心数
 
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-
-# =============================================================================
-# 文件: car_logistics_env.py
-# 作者: [Neo]
-# 日期: 2023-10-27
-# 描述: 基于Gymnasium的汽车物流模拟环境，用于强化学习决策。
-#       模拟汽车从工厂、仓库到客户和经销商的调度与运输过程，目标是最小化总成本。
-# =============================================================================
+from stable_baselines3.common.utils import set_random_seed
 
 # --- 常量定义 ---
-NUM_WEEKS_PER_YEAR: int = 52  # 每年模拟的周数
-
-# 车型定义
-CAR_TYPES: List[str] = ['High', 'Mid', 'Low']
-NUM_CAR_TYPES: int = len(CAR_TYPES)
-
-# 地点定义
-FACTORY: str = "Factory"  # 工厂
-NUM_TEMP_WAREHOUSES: int = 6  # 临时仓库数量
-WAREHOUSES: List[str] = [f"WH_{i}" for i in range(NUM_TEMP_WAREHOUSES)]
-
-NUM_LARGE_CUSTOMERS: int = 3  # 大客户数量
-LARGE_CUSTOMERS: List[str] = [f"LC_{i}" for i in range(NUM_LARGE_CUSTOMERS)]
-
-NUM_4S_STORES: int = 5  # 4S店数量 (通常只销售高端车)
-S4_STORES: List[str] = [f"4S_{i}" for i in range(NUM_4S_STORES)]
-
-NUM_DEALERS: int = 8  # 经销商数量 (通常销售中低端车)
-DEALERS: List[str] = [f"Dealer_{i}" for i in range(NUM_DEALERS)]
-
-ALL_LOCATIONS: List[str] = [FACTORY] + WAREHOUSES + LARGE_CUSTOMERS + S4_STORES + DEALERS
-
-# 成本与容量
-TRANSPORT_COST_PER_KM: Dict[str, float] = {  # 每公里每辆车的运输成本
-    'High': 3.0,
-    'Mid': 2.0,
-    'Low': 1.5
-}
-
-FACTORY_PROD_RANGES: Dict[str, Tuple[int, int]] = {  # 工厂各车型周生产范围
-    'High': (30, 80),
-    'Mid': (60, 150),
-    'Low': (70, 180)
-}
-
-LC_DEMAND_RANGES: Dict[str, Tuple[int, int]] = {ct: (1, 6) for ct in CAR_TYPES}  # 大客户需求范围
-S4_DEMAND_RANGES: Dict[str, Tuple[int, int]] = {'High': (2, 10)}  # 4S店需求范围 (只销售High型车)
-DEALER_DEMAND_RANGES: Dict[str, Tuple[int, int]] = {'Mid': (3, 15), 'Low': (3, 15)}  # 经销商需求范围 (销售Mid, Low型车)
-
-MAX_WAREHOUSE_CAPACITY_PER_TYPE: int = 500  # 单个仓库单车型的最大库存容量（用于观测值归一化）
-MAX_PRODUCTION_PER_TYPE: int = max(val[1] for val in FACTORY_PROD_RANGES.values()) + 20  # 最大生产量（用于观测值归一化）
-MAX_DEMAND_PER_ENTITY_PER_TYPE: int = 20  # 单个客户或经销商单车型的最大需求量（用于观测值归一化）
-
-UNMET_DEMAND_PENALTY: int = 100000  # 未满足需求惩罚
+NUM_WEEKS_PER_YEAR = 52
+CAR_TYPES = ['High', 'Mid', 'Low']
+NUM_CAR_TYPES = len(CAR_TYPES)
+FACTORY = "Factory"
+NUM_TEMP_WAREHOUSES = 6
+WAREHOUSES = [f"WH_{i}" for i in range(NUM_TEMP_WAREHOUSES)]
+NUM_LARGE_CUSTOMERS = 3
+LARGE_CUSTOMERS = [f"LC_{i}" for i in range(NUM_LARGE_CUSTOMERS)]
+NUM_4S_STORES = 5
+S4_STORES = [f"4S_{i}" for i in range(NUM_4S_STORES)]
+NUM_DEALERS = 8
+DEALERS = [f"Dealer_{i}" for i in range(NUM_DEALERS)]
+ALL_LOCATIONS = [FACTORY] + WAREHOUSES + LARGE_CUSTOMERS + S4_STORES + DEALERS
+TRANSPORT_COST_PER_KM = {'High': 3.0, 'Mid': 2.0, 'Low': 1.5}
+FACTORY_PROD_RANGES = {'High': (30, 80), 'Mid': (60, 150), 'Low': (70, 180)}
+LC_DEMAND_RANGES = {ct: (1, 6) for ct in CAR_TYPES}
+S4_DEMAND_RANGES = {'High': (2, 10)}
+DEALER_DEMAND_RANGES = {'Mid': (3, 15), 'Low': (3, 15)}
+MAX_WAREHOUSE_CAPACITY_PER_TYPE = 500
+MAX_PRODUCTION_PER_TYPE = max(val[1] for val in FACTORY_PROD_RANGES.values()) + 20
+MAX_DEMAND_PER_ENTITY_PER_TYPE = 20
+UNMET_DEMAND_PENALTY_ENV = 2000000
 
 
 class CarLogisticsEnv(gym.Env):
-    """
-    汽车物流模拟环境，用于强化学习决策。
-
-    环境模拟了汽车从工厂、仓库到不同类型客户（大客户、4S店、经销商）的
-    生产、库存和调度过程。代理的目标是最小化总运输成本和未满足需求惩罚。
-    """
     metadata = {'render_modes': ['human'], 'render_fps': 4}
 
-    def __init__(self, seed: Optional[int] = None):
-        """
-        初始化汽车物流环境。
-
-        Args:
-            seed (int, optional): 随机种子，用于复现环境状态。
-        """
+    def __init__(self, seed=None):
         super().__init__()
-        self.seed = seed
-        if self.seed is not None:
-            np.random.seed(self.seed)
-            random.seed(self.seed)
+        self.np_random, self.seed = gym.utils.seeding.np_random(seed)
+        if self.seed is not None: random.seed(int(self.seed))
+        self.current_week = 0
+        self.distances = self._generate_distances()
+        self.car_type_to_idx = {name: i for i, name in enumerate(CAR_TYPES)}
+        self.observation_space = spaces.Box(low=0, high=1.0, shape=(51,), dtype=np.float32)
+        num_demand_points = (NUM_LARGE_CUSTOMERS * NUM_CAR_TYPES) + (NUM_4S_STORES * 1) + (NUM_DEALERS * 2)
+        num_source_options = 1 + NUM_TEMP_WAREHOUSES
+        num_excess_prod_decisions = NUM_CAR_TYPES
+        num_excess_dest_options = NUM_TEMP_WAREHOUSES
+        action_dims = [num_source_options] * num_demand_points + [num_excess_dest_options] * num_excess_prod_decisions
+        self.action_space = spaces.MultiDiscrete(action_dims)
+        self.warehouse_inventory = np.zeros((NUM_TEMP_WAREHOUSES, NUM_CAR_TYPES), dtype=int)
+        self.current_production = {ct: 0 for ct in CAR_TYPES}
+        self.current_demands = {}
+        self.initial_stock_per_type_per_wh = 15
 
-        self.current_week: int = 0
-        self.distances: Dict[Tuple[str, str], int] = self._generate_distances()
-        self.car_type_to_idx: Dict[str, int] = {name: i for i, name in enumerate(CAR_TYPES)}
-
-        # 观测空间定义
-        # 组成：
-        # - 工厂当前生产量 (3: High, Mid, Low)
-        # - 各仓库库存量 (6个仓库 * 3种车型 = 18)
-        # - 大客户需求量 (3个客户 * 3种车型 = 9)
-        # - 4S店需求量 (5个店 * 1种车型 = 5)
-        # - 经销商需求量 (8个经销商 * 2种车型 = 16)
-        # 总计: 3 + 18 + 9 + 5 + 16 = 51
-        self.observation_space = spaces.Box(
-            low=0.0, high=1.0, shape=(51,), dtype=np.float32
-        )
-
-        # 动作空间定义
-        # 每个需求点（大客户、4S店、经销商）的每种车型，代理选择来源（0: 工厂, 1-6: WH_0到WH_5）
-        # - 大客户 (3 * 3 = 9个决策)
-        # - 4S店 (5 * 1 = 5个决策)
-        # - 经销商 (8 * 2 = 16个决策)
-        # 生产过剩的决策：工厂生产过剩的每种车型，代理选择一个仓库存储 (6个仓库选项)
-        # - 生产过剩 (3个决策)
-        # 总计：9 + 5 + 16 + 3 = 33 个决策
-        # 每个决策的可能值范围是0到 NUM_TEMP_WAREHOUSES (0代表工厂, 1-6代表仓库)
-        # 生产过剩决策的可能值范围是0到 NUM_TEMP_WAREHOUSES-1 (0-5代表仓库)
-
-        num_demand_points_decisions = (NUM_LARGE_CUSTOMERS * NUM_CAR_TYPES) + \
-                                      (NUM_4S_STORES * 1) + \
-                                      (NUM_DEALERS * 2)
-
-        num_source_options = 1 + NUM_TEMP_WAREHOUSES  # 0: Factory, 1-6: WH_0 to WH_5
-
-        demand_action_dims = [num_source_options] * num_demand_points_decisions
-
-        num_excess_prod_decisions = NUM_CAR_TYPES  # 每个车型一个决策
-        excess_prod_action_dims = [NUM_TEMP_WAREHOUSES] * num_excess_prod_decisions  # 0-5 for warehouses
-
-        self.action_space = spaces.MultiDiscrete(demand_action_dims + excess_prod_action_dims)
-
-        # 状态变量初始化
-        self.warehouse_inventory: np.ndarray = np.zeros((NUM_TEMP_WAREHOUSES, NUM_CAR_TYPES), dtype=int)
-        self.current_production: Dict[str, int] = {}  # 工厂当周生产量
-        self.current_demands: Dict[str, Any] = {}  # 当周客户需求
-
-    def _generate_distances(self) -> Dict[Tuple[str, str], int]:
-        """
-        生成所有地点之间的随机距离。
-        工厂到仓库距离较近 (50-200km)，其他地点之间距离较远 (100-1000km)。
-
-        Returns:
-            Dict[Tuple[str, str], int]: 地点对到距离的映射。
-        """
-        distances: Dict[Tuple[str, str], int] = {}
+    def _generate_distances(self):
+        distances = {}
         for i in range(len(ALL_LOCATIONS)):
             for j in range(i + 1, len(ALL_LOCATIONS)):
                 loc1, loc2 = ALL_LOCATIONS[i], ALL_LOCATIONS[j]
-                # 特殊处理工厂到仓库的距离
-                is_fac_wh = (loc1 == FACTORY and loc2.startswith("WH")) or \
-                            (loc2 == FACTORY and loc1.startswith("WH"))
-                dist_val = random.randint(50, 200) if is_fac_wh else random.randint(100, 1000)
+                is_fac_wh = (loc1 == FACTORY and loc2.startswith("WH")) or (loc2 == FACTORY and loc1.startswith("WH"))
+                dist_val = self.np_random.integers(50, 200, endpoint=True) if is_fac_wh else self.np_random.integers(
+                    100, 1000, endpoint=True)
                 distances[(loc1, loc2)] = dist_val
                 distances[(loc2, loc1)] = dist_val
-            # 同一地点距离为0
             distances[(ALL_LOCATIONS[i], ALL_LOCATIONS[i])] = 0
         return distances
 
-    def get_distance(self, loc1_name: str, loc2_name: str) -> int:
-        """
-        获取两个地点之间的距离。
-
-        Args:
-            loc1_name (str): 地点1的名称。
-            loc2_name (str): 地点2的名称。
-
-        Returns:
-            int: 两个地点之间的距离（公里）。如果距离不存在，返回无穷大。
-        """
+    def get_distance(self, loc1_name, loc2_name):
         return self.distances.get((loc1_name, loc2_name), float('inf'))
 
-    def _generate_production(self) -> Dict[str, int]:
-        """
-        生成当周工厂生产量。
-
-        Returns:
-            Dict[str, int]: 各车型当周生产量。
-        """
-        production: Dict[str, int] = {}
-        for car_type in CAR_TYPES:
-            min_p, max_p = FACTORY_PROD_RANGES[car_type]
-            production[car_type] = random.randint(min_p, max_p)
+    def _generate_production(self):
+        production = {}
+        for car_type in CAR_TYPES: min_p, max_p = FACTORY_PROD_RANGES[car_type]; production[
+            car_type] = self.np_random.integers(min_p, max_p, endpoint=True)
         return production
 
-    def _generate_demands(self) -> Dict[str, Any]:
-        """
-        生成当周各类型客户的随机需求。
-
-        Returns:
-            Dict[str, Any]: 包含LC, 4S, Dealer客户需求的字典。
-        """
-        demands: Dict[str, Any] = {
-            'LC': [{} for _ in range(NUM_LARGE_CUSTOMERS)],
-            '4S': [{} for _ in range(NUM_4S_STORES)],
-            'Dealer': [{} for _ in range(NUM_DEALERS)]
-        }
-
-        # 大客户需求 (所有车型)
+    def _generate_demands(self):
+        demands = {'LC': [{} for _ in range(NUM_LARGE_CUSTOMERS)], '4S': [{} for _ in range(NUM_4S_STORES)],
+                   'Dealer': [{} for _ in range(NUM_DEALERS)]}
         for i in range(NUM_LARGE_CUSTOMERS):
-            for car_type in CAR_TYPES:
-                min_d, max_d = LC_DEMAND_RANGES[car_type]
-                demands['LC'][i][car_type] = random.randint(min_d, max_d)
-
-        # 4S店需求 (只针对'High'型车)
-        for i in range(NUM_4S_STORES):
-            min_d, max_d = S4_DEMAND_RANGES['High']
-            demands['4S'][i]['High'] = random.randint(min_d, max_d)
-
-        # 经销商需求 (只针对'Mid', 'Low'型车)
+            for car_type in CAR_TYPES: min_d, max_d = LC_DEMAND_RANGES[car_type]; demands['LC'][i][
+                car_type] = self.np_random.integers(min_d, max_d, endpoint=True)
+        for i in range(NUM_4S_STORES): min_d, max_d = S4_DEMAND_RANGES['High']; demands['4S'][i][
+            'High'] = self.np_random.integers(min_d, max_d, endpoint=True)
         for i in range(NUM_DEALERS):
-            for car_type in ['Mid', 'Low']:
-                min_d, max_d = DEALER_DEMAND_RANGES[car_type]
-                demands['Dealer'][i][car_type] = random.randint(min_d, max_d)
+            for car_type in ['Mid', 'Low']: min_d, max_d = DEALER_DEMAND_RANGES[car_type]; demands['Dealer'][i][
+                car_type] = self.np_random.integers(min_d, max_d, endpoint=True)
         return demands
 
-    def _get_obs(self) -> np.ndarray:
-        """
-        根据当前环境状态生成观测值。
-        所有观测值会被归一化到 [0, 1] 范围。
-
-        Returns:
-            np.ndarray: 归一化后的观测值数组。
-        """
-        obs: List[float] = []
-
-        # 1. 工厂当前生产量
-        for car_type in CAR_TYPES:
-            obs.append(self.current_production.get(car_type, 0) / MAX_PRODUCTION_PER_TYPE)
-
-        # 2. 各仓库库存量
+    def _get_obs(self):
+        obs = []
+        for car_type in CAR_TYPES: obs.append(self.current_production[car_type] / MAX_PRODUCTION_PER_TYPE)
         for i in range(NUM_TEMP_WAREHOUSES):
-            for j in range(NUM_CAR_TYPES):
-                obs.append(self.warehouse_inventory[i, j] / MAX_WAREHOUSE_CAPACITY_PER_TYPE)
-
-        # 3. 大客户需求量
+            for j in range(NUM_CAR_TYPES): obs.append(self.warehouse_inventory[i, j] / MAX_WAREHOUSE_CAPACITY_PER_TYPE)
         for i in range(NUM_LARGE_CUSTOMERS):
-            for car_type in CAR_TYPES:
-                obs.append(self.current_demands['LC'][i].get(car_type, 0) / MAX_DEMAND_PER_ENTITY_PER_TYPE)
-
-        # 4. 4S店需求量 (仅'High'型车)
-        for i in range(NUM_4S_STORES):
-            obs.append(self.current_demands['4S'][i].get('High', 0) / MAX_DEMAND_PER_ENTITY_PER_TYPE)
-
-        # 5. 经销商需求量 (仅'Mid', 'Low'型车)
+            for car_type in CAR_TYPES: obs.append(
+                self.current_demands['LC'][i].get(car_type, 0) / MAX_DEMAND_PER_ENTITY_PER_TYPE)
+        for i in range(NUM_4S_STORES): obs.append(
+            self.current_demands['4S'][i].get('High', 0) / MAX_DEMAND_PER_ENTITY_PER_TYPE)
         for i in range(NUM_DEALERS):
-            for car_type in ['Mid', 'Low']:
-                obs.append(self.current_demands['Dealer'][i].get(car_type, 0) / MAX_DEMAND_PER_ENTITY_PER_TYPE)
-
-        # 确保所有值都在 [0, 1] 范围内
+            for car_type in ['Mid', 'Low']: obs.append(
+                self.current_demands['Dealer'][i].get(car_type, 0) / MAX_DEMAND_PER_ENTITY_PER_TYPE)
         return np.array(obs, dtype=np.float32).clip(0, 1)
 
-    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[np.ndarray, Dict]:
-        """
-        重置环境到初始状态。
-
-        Args:
-            seed (int, optional): 重置时的随机种子。
-            options (Dict, optional): 额外选项。
-
-        Returns:
-            Tuple[np.ndarray, Dict]: 初始观测值和信息字典。
-        """
+    def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        if seed is not None:
-            np.random.seed(seed)
-            random.seed(seed)
-
+        if seed is not None: self.np_random, self.seed = gym.utils.seeding.np_random(seed); random.seed(int(self.seed))
         self.current_week = 0
-        self.warehouse_inventory = np.zeros((NUM_TEMP_WAREHOUSES, NUM_CAR_TYPES), dtype=int)
+        self.warehouse_inventory = np.full((NUM_TEMP_WAREHOUSES, NUM_CAR_TYPES), self.initial_stock_per_type_per_wh,
+                                           dtype=int)
         self.current_production = self._generate_production()
         self.current_demands = self._generate_demands()
+        return self._get_obs(), self._get_info()
 
-        observation = self._get_obs()
-        info = self._get_info()
-        return observation, info
+    def _get_info(self):
+        return {"current_week": self.current_week + 1, "warehouse_inventory": self.warehouse_inventory.copy(),
+                "factory_production": self.current_production.copy(), "demands": self.current_demands.copy(),
+                "distances": self.distances.copy()}
 
-    def _get_info(self) -> Dict[str, Any]:
-        """
-        获取当前环境的辅助信息。
-
-        Returns:
-            Dict[str, Any]: 包含当前周、库存、生产和需求的字典。
-        """
-        return {
-            "current_week": self.current_week + 1,  # 周从1开始计数
-            "warehouse_inventory": self.warehouse_inventory.copy(),
-            "factory_production": self.current_production.copy(),
-            "demands": self.current_demands.copy(),
-        }
-
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
-        """
-        执行一个动作，推进环境一个时间步。
-
-        Args:
-            action (np.ndarray): 代理的动作数组。
-
-        Returns:
-            Tuple[np.ndarray, float, bool, bool, Dict]:
-                - observation (np.ndarray): 新的观测值。
-                - reward (float): 奖励值。
-                - terminated (bool): 是否达到终止状态。
-                - truncated (bool): 是否因时间限制而终止（未完全完成）。
-                - info (Dict): 包含额外信息的字典。
-        """
+    def step(self, action):
         week_for_log = self.current_week + 1
-        total_transport_cost = 0.0
-        unmet_demand_this_step = 0
-
-        # 在本周内用于计算的库存和生产量，防止直接修改self.变量
+        total_transport_cost_this_step = 0.0
+        unmet_demand_units_this_step = 0
         current_factory_stock_for_step = self.current_production.copy()
         current_wh_stock_for_step = self.warehouse_inventory.copy()
-
-        weekly_dispatch_records: List[Dict[str, Any]] = []
-
-        # --- 1. 解析动作并构建需求履行任务列表 ---
-        demand_fulfillment_tasks: List[Dict[str, Any]] = []
+        weekly_dispatch_records = []
         action_idx = 0
-
-        # Large Customers (LC)
+        demand_fulfillment_tasks = []
         for lc_idx in range(NUM_LARGE_CUSTOMERS):
             for car_type in CAR_TYPES:
+                ct_idx = self.car_type_to_idx[car_type]
                 demand_qty = self.current_demands['LC'][lc_idx].get(car_type, 0)
-                if demand_qty > 0:
-                    source_choice = action[action_idx]
-                    demand_fulfillment_tasks.append({
-                        'qty': demand_qty,
-                        'car_type': car_type,
-                        'ct_idx': self.car_type_to_idx[car_type],
-                        'source_choice': source_choice,
-                        'dest_name': LARGE_CUSTOMERS[lc_idx],
-                        'original_demand_qty': demand_qty  # 用于后续判断是否需回退
-                    })
+                if demand_qty > 0: source_choice = action[action_idx]; demand_fulfillment_tasks.append(
+                    {'qty': demand_qty, 'car_type': car_type, 'ct_idx': ct_idx, 'source_choice': source_choice,
+                     'dest_name': LARGE_CUSTOMERS[lc_idx], 'original_demand_qty': demand_qty})
                 action_idx += 1
-
-        # 4S Stores (High Car Type Only)
+        ht_idx = self.car_type_to_idx['High']
         for s4_idx in range(NUM_4S_STORES):
             demand_qty = self.current_demands['4S'][s4_idx].get('High', 0)
-            if demand_qty > 0:
-                source_choice = action[action_idx]
-                demand_fulfillment_tasks.append({
-                    'qty': demand_qty,
-                    'car_type': 'High',
-                    'ct_idx': self.car_type_to_idx['High'],
-                    'source_choice': source_choice,
-                    'dest_name': S4_STORES[s4_idx],
-                    'original_demand_qty': demand_qty
-                })
+            if demand_qty > 0: source_choice = action[action_idx]; demand_fulfillment_tasks.append(
+                {'qty': demand_qty, 'car_type': 'High', 'ct_idx': ht_idx, 'source_choice': source_choice,
+                 'dest_name': S4_STORES[s4_idx], 'original_demand_qty': demand_qty})
             action_idx += 1
-
-        # Dealers (Mid and Low Car Types Only)
         for dlr_idx in range(NUM_DEALERS):
             for car_type in ['Mid', 'Low']:
+                ct_idx = self.car_type_to_idx[car_type]
                 demand_qty = self.current_demands['Dealer'][dlr_idx].get(car_type, 0)
-                if demand_qty > 0:
-                    source_choice = action[action_idx]
-                    demand_fulfillment_tasks.append({
-                        'qty': demand_qty,
-                        'car_type': car_type,
-                        'ct_idx': self.car_type_to_idx[car_type],
-                        'source_choice': source_choice,
-                        'dest_name': DEALERS[dlr_idx],
-                        'original_demand_qty': demand_qty
-                    })
+                if demand_qty > 0: source_choice = action[action_idx]; demand_fulfillment_tasks.append(
+                    {'qty': demand_qty, 'car_type': car_type, 'ct_idx': ct_idx, 'source_choice': source_choice,
+                     'dest_name': DEALERS[dlr_idx], 'original_demand_qty': demand_qty})
                 action_idx += 1
-
-        # --- 2. 尝试满足每个需求任务 (首次调度和回退逻辑) ---
         for task in demand_fulfillment_tasks:
-            qty_to_fulfill = task['qty']
-            car_type = task['car_type']
-            ct_idx = task['ct_idx']
-            source_choice_agent = task['source_choice']
-            dest_name = task['dest_name']
-            fulfilled_this_task = 0
-
-            # 定义一个内部函数，用于从特定来源尝试发货
-            def _try_dispatch(source_name: str, current_stock: Dict[str, int] | np.ndarray,
-                              target_qty: int, is_factory: bool, wh_idx: Optional[int] = None) -> Tuple[int, float]:
-                """尝试从给定来源发货，并返回实际发货量和运输成本。"""
-                actual_shipped = 0
-                cost_incurred = 0.0
-
-                if is_factory:
-                    available = current_stock[car_type]  # type: ignore
-                else:
-                    available = current_stock[wh_idx, ct_idx]  # type: ignore
-
-                can_ship = min(target_qty, available)
-                if can_ship > 0:
-                    if is_factory:
-                        current_stock[car_type] -= can_ship  # type: ignore
-                    else:
-                        current_stock[wh_idx, ct_idx] -= can_ship  # type: ignore
-
-                    cost_incurred = can_ship * self.get_distance(source_name, dest_name) * TRANSPORT_COST_PER_KM[
-                        car_type]
-                    actual_shipped = can_ship
-                return actual_shipped, cost_incurred
-
-            # 首次尝试从代理选择的来源发货
-            source_name_primary: str
-            if source_choice_agent == 0:  # 工厂
-                source_name_primary = FACTORY
-                shipped, cost = _try_dispatch(source_name_primary, current_factory_stock_for_step, qty_to_fulfill, True)
-                reason_prefix = "Demand (Agent: Factory)"
-            else:  # 仓库
-                wh_idx_primary = source_choice_agent - 1
-                source_name_primary = WAREHOUSES[wh_idx_primary]
-                shipped, cost = _try_dispatch(source_name_primary, current_wh_stock_for_step, qty_to_fulfill, False,
-                                              wh_idx_primary)
-                reason_prefix = f"Demand (Agent: WH_{wh_idx_primary})"
-
-            if shipped > 0:
-                total_transport_cost += cost
-                fulfilled_this_task += shipped
-                weekly_dispatch_records.append({
-                    'week': week_for_log, 'type': 'demand_fulfillment', 'car_type': car_type,
-                    'quantity': shipped, 'source': source_name_primary, 'destination': dest_name,
-                    'reason': reason_prefix, 'cost': round(cost, 2)
-                })
-
-            remaining_to_fulfill = qty_to_fulfill - fulfilled_this_task
-
-            # 回退逻辑：如果代理选择的来源不足，尝试从其他来源补足
-            if remaining_to_fulfill > 0:
-                # 尝试从工厂补足 (如果代理选择的不是工厂，或工厂还有剩余)
-                if current_factory_stock_for_step[car_type] > 0:
-                    shipped_fallback_fac, cost_fallback_fac = _try_dispatch(FACTORY, current_factory_stock_for_step,
-                                                                            remaining_to_fulfill, True)
-                    if shipped_fallback_fac > 0:
-                        total_transport_cost += cost_fallback_fac
-                        fulfilled_this_task += shipped_fallback_fac
-                        remaining_to_fulfill -= shipped_fallback_fac
-                        weekly_dispatch_records.append({
-                            'week': week_for_log, 'type': 'demand_fallback', 'car_type': car_type,
-                            'quantity': shipped_fallback_fac, 'source': FACTORY, 'destination': dest_name,
-                            'reason': "Demand (Fallback: Factory)", 'cost': round(cost_fallback_fac, 2)
-                        })
-
-            if remaining_to_fulfill > 0:
-                # 尝试从其他仓库补足 (按成本排序，优先选择成本低的仓库)
+            car_type, ct_idx, source_choice_agent, dest_name, original_demand_qty_for_task = task['car_type'], task[
+                'ct_idx'], task['source_choice'], task['dest_name'], task['original_demand_qty']
+            fulfilled_this_task_total = 0
+            if source_choice_agent == 0:
+                source_name = FACTORY;
+                available = current_factory_stock_for_step[car_type];
+                can_ship = min(original_demand_qty_for_task, available)
+                if can_ship > 0: current_factory_stock_for_step[
+                    car_type] -= can_ship; cost_this_shipment = can_ship * self.get_distance(source_name, dest_name) * \
+                                                                TRANSPORT_COST_PER_KM[
+                                                                    car_type]; total_transport_cost_this_step += cost_this_shipment; fulfilled_this_task_total += can_ship; weekly_dispatch_records.append(
+                    {'week': week_for_log, 'type': 'demand_fulfillment', 'car_type': car_type, 'quantity': can_ship,
+                     'source': source_name, 'destination': dest_name, 'reason': f"Demand (Agent: Factory)",
+                     'cost': round(cost_this_shipment, 2)})
+            else:
+                wh_idx = source_choice_agent - 1
+                if 0 <= wh_idx < NUM_TEMP_WAREHOUSES:
+                    source_name = WAREHOUSES[wh_idx];
+                    available = current_wh_stock_for_step[wh_idx, ct_idx];
+                    can_ship = min(original_demand_qty_for_task, available)
+                    if can_ship > 0: current_wh_stock_for_step[
+                        wh_idx, ct_idx] -= can_ship; cost_this_shipment = can_ship * self.get_distance(source_name,
+                                                                                                       dest_name) * \
+                                                                          TRANSPORT_COST_PER_KM[
+                                                                              car_type]; total_transport_cost_this_step += cost_this_shipment; fulfilled_this_task_total += can_ship; weekly_dispatch_records.append(
+                        {'week': week_for_log, 'type': 'demand_fulfillment', 'car_type': car_type, 'quantity': can_ship,
+                         'source': source_name, 'destination': dest_name, 'reason': f"Demand (Agent: {source_name})",
+                         'cost': round(cost_this_shipment, 2)})
+            remaining_to_fulfill_for_task = original_demand_qty_for_task - fulfilled_this_task_total
+            if remaining_to_fulfill_for_task > 0 and source_choice_agent != 0:
+                source_name_alt = FACTORY;
+                available_alt = current_factory_stock_for_step[car_type];
+                can_ship_alt = min(remaining_to_fulfill_for_task, available_alt)
+                if can_ship_alt > 0: current_factory_stock_for_step[
+                    car_type] -= can_ship_alt; cost_this_shipment = can_ship_alt * self.get_distance(source_name_alt,
+                                                                                                     dest_name) * \
+                                                                    TRANSPORT_COST_PER_KM[
+                                                                        car_type]; total_transport_cost_this_step += cost_this_shipment; fulfilled_this_task_total += can_ship_alt; remaining_to_fulfill_for_task -= can_ship_alt; weekly_dispatch_records.append(
+                    {'week': week_for_log, 'type': 'demand_fallback', 'car_type': car_type, 'quantity': can_ship_alt,
+                     'source': source_name_alt, 'destination': dest_name, 'reason': f"Demand (Fallback: Factory)",
+                     'cost': round(cost_this_shipment, 2)})
+            if remaining_to_fulfill_for_task > 0:
                 candidate_whs = []
                 for wh_alt_idx_cand in range(NUM_TEMP_WAREHOUSES):
-                    if current_wh_stock_for_step[wh_alt_idx_cand, ct_idx] > 0:
-                        cost = self.get_distance(WAREHOUSES[wh_alt_idx_cand], dest_name) * TRANSPORT_COST_PER_KM[
-                            car_type]
-                        candidate_whs.append({'idx': wh_alt_idx_cand, 'cost': cost,
-                                              'stock': current_wh_stock_for_step[wh_alt_idx_cand, ct_idx]})
-                candidate_whs.sort(key=lambda x: x['cost'])  # 按运输成本升序排序
-
+                    if source_choice_agent == (wh_alt_idx_cand + 1): continue
+                    if current_wh_stock_for_step[wh_alt_idx_cand, ct_idx] > 0: cost = self.get_distance(
+                        WAREHOUSES[wh_alt_idx_cand], dest_name) * TRANSPORT_COST_PER_KM[car_type]; candidate_whs.append(
+                        {'idx': wh_alt_idx_cand, 'cost': cost,
+                         'stock': current_wh_stock_for_step[wh_alt_idx_cand, ct_idx]})
+                candidate_whs.sort(key=lambda x: x['cost'])
                 for wh_cand in candidate_whs:
-                    if remaining_to_fulfill == 0:
-                        break  # 已满足所有需求
-
-                    wh_alt_idx = wh_cand['idx']
-                    source_name_alt = WAREHOUSES[wh_alt_idx]
-
-                    shipped_fallback_wh, cost_fallback_wh = _try_dispatch(source_name_alt, current_wh_stock_for_step,
-                                                                          remaining_to_fulfill, False, wh_alt_idx)
-
-                    if shipped_fallback_wh > 0:
-                        total_transport_cost += cost_fallback_wh
-                        fulfilled_this_task += shipped_fallback_wh
-                        remaining_to_fulfill -= shipped_fallback_wh
-                        weekly_dispatch_records.append({
-                            'week': week_for_log, 'type': 'demand_fallback', 'car_type': car_type,
-                            'quantity': shipped_fallback_wh, 'source': source_name_alt, 'destination': dest_name,
-                            'reason': f"Demand (Fallback: WH_{wh_alt_idx})", 'cost': round(cost_fallback_wh, 2)
-                        })
-
-            # 记录未满足的需求
-            if remaining_to_fulfill > 0:
-                unmet_demand_this_step += remaining_to_fulfill
-                weekly_dispatch_records.append({
-                    'week': week_for_log, 'type': 'unmet_demand', 'car_type': car_type,
-                    'quantity': remaining_to_fulfill, 'source': 'N/A', 'destination': dest_name,
-                    'reason': "Unmet Demand", 'cost': 0.0  # 未满足需求无运输成本
-                })
-
-        # 更新环境的仓库库存（已考虑本周调度消耗）
+                    if remaining_to_fulfill_for_task == 0: break
+                    wh_alt_idx, source_name_alt = wh_cand['idx'], WAREHOUSES[wh_cand['idx']];
+                    available_alt = current_wh_stock_for_step[wh_alt_idx, ct_idx];
+                    can_ship_alt = min(remaining_to_fulfill_for_task, available_alt)
+                    if can_ship_alt > 0: current_wh_stock_for_step[
+                        wh_alt_idx, ct_idx] -= can_ship_alt; cost_this_shipment = can_ship_alt * self.get_distance(
+                        source_name_alt, dest_name) * TRANSPORT_COST_PER_KM[
+                                                                                      car_type]; total_transport_cost_this_step += cost_this_shipment; fulfilled_this_task_total += can_ship_alt; remaining_to_fulfill_for_task -= can_ship_alt; weekly_dispatch_records.append(
+                        {'week': week_for_log, 'type': 'demand_fallback', 'car_type': car_type,
+                         'quantity': can_ship_alt, 'source': source_name_alt, 'destination': dest_name,
+                         'reason': f"Demand (Fallback: {source_name_alt})", 'cost': round(cost_this_shipment, 2)})
+            if remaining_to_fulfill_for_task > 0: unmet_demand_units_this_step += remaining_to_fulfill_for_task
         self.warehouse_inventory = current_wh_stock_for_step.copy()
-
-        # --- 3. 处理工厂生产过剩的库存调度 ---
-        excess_prod_actions = action[action_idx:]  # 动作数组的剩余部分用于处理生产过剩
-
+        excess_prod_actions = action[action_idx:]
         for i, car_type in enumerate(CAR_TYPES):
-            ct_idx = self.car_type_to_idx[car_type]
-            qty_excess = current_factory_stock_for_step[car_type]  # 工厂剩余库存（未满足需求）
-
+            ct_idx = self.car_type_to_idx[car_type];
+            qty_excess = current_factory_stock_for_step[car_type]
             if qty_excess > 0:
-                # 代理选择目标仓库 (0-5)
                 target_wh_idx_agent = excess_prod_actions[i]
-
-                # 确保目标仓库索引有效，如果无效，默认存入第一个仓库WH_0
-                if not (0 <= target_wh_idx_agent < NUM_TEMP_WAREHOUSES):
-                    target_wh_idx_agent = 0
-
-                source_name = FACTORY
-                dest_name = WAREHOUSES[target_wh_idx_agent]
-
+                if not (0 <= target_wh_idx_agent < NUM_TEMP_WAREHOUSES): target_wh_idx_agent = 0
+                source_name, dest_name = FACTORY, WAREHOUSES[target_wh_idx_agent];
                 cost_this_shipment = qty_excess * self.get_distance(source_name, dest_name) * TRANSPORT_COST_PER_KM[
-                    car_type]
-                total_transport_cost += cost_this_shipment
-
-                # 将工厂剩余库存转移到目标仓库
-                self.warehouse_inventory[target_wh_idx_agent, ct_idx] += qty_excess
-                current_factory_stock_for_step[car_type] = 0  # 工厂清零
-
-                weekly_dispatch_records.append({
-                    'week': week_for_log, 'type': 'factory_to_wh', 'car_type': car_type,
-                    'quantity': qty_excess, 'source': source_name, 'destination': dest_name,
-                    'reason': f"Excess Prod. to WH_{target_wh_idx_agent}", 'cost': round(cost_this_shipment, 2)
-                })
-
-        # --- 4. 计算奖励 ---
-        reward: float = -total_transport_cost  # 运输成本是负奖励
-        if unmet_demand_this_step > 0:
-            reward -= unmet_demand_this_step * UNMET_DEMAND_PENALTY  # 未满足需求惩罚
-
-        # --- 5. 推进时间步和更新环境状态 ---
-        self.current_week += 1
-        terminated = (self.current_week >= NUM_WEEKS_PER_YEAR)
-        truncated = False  # 如果有TimeLimitWrapper会设置这个
-
-        if not terminated:
-            # 如果没有终止，生成下一周的生产和需求
-            self.current_production = self._generate_production()
-            self.current_demands = self._generate_demands()
-
-        observation = self._get_obs()
+                    car_type];
+                total_transport_cost_this_step += cost_this_shipment;
+                self.warehouse_inventory[target_wh_idx_agent, ct_idx] += qty_excess;
+                weekly_dispatch_records.append(
+                    {'week': week_for_log, 'type': 'factory_to_wh', 'car_type': car_type, 'quantity': qty_excess,
+                     'source': source_name, 'destination': dest_name, 'reason': f"Excess Prod. to {dest_name}",
+                     'cost': round(cost_this_shipment, 2)})
+        unmet_demand_penalty_this_step = unmet_demand_units_this_step * UNMET_DEMAND_PENALTY_ENV
+        reward = -(total_transport_cost_this_step + unmet_demand_penalty_this_step)
+        self.current_week += 1;
+        terminated = (self.current_week >= NUM_WEEKS_PER_YEAR);
+        truncated = False
+        if not terminated: self.current_production = self._generate_production(); self.current_demands = self._generate_demands()
+        observation = self._get_obs();
         info = self._get_info()
-        info['unmet_this_step'] = unmet_demand_this_step
+        info['unmet_this_step'] = unmet_demand_units_this_step;
+        info['transport_cost_this_step'] = total_transport_cost_this_step;
         info['dispatch_records'] = weekly_dispatch_records
-
         return observation, reward, terminated, truncated, info
 
     def render(self):
-        """
-        环境渲染方法 (当前未实现)。
-        """
         pass
 
     def close(self):
-        """
-        关闭环境资源 (当前无特定资源需关闭)。
-        """
         pass
 
 
-def make_env(seed: int = 42, rank: int = 0, log_dir: Optional[str] = None) -> callable:
-    """
-    创建并返回一个用于Stable-Baselines3的Gymnasium环境初始化函数。
-    可以指定随机种子，并可选地配置Monitor来记录环境信息。
-
-    Args:
-        seed (int): 基础随机种子。
-        rank (int): 环境的排名（用于多环境并行训练）。
-        log_dir (Optional[str]): Monitor日志文件保存目录。
-
-    Returns:
-        callable: 一个返回 Gymnasium 环境实例的函数。
-    """
-
-    def _init() -> gym.Env:
-        env_raw = CarLogisticsEnv(seed=seed + rank)
-        if log_dir:
-            monitor_path = os.path.join(log_dir, str(rank))
-            os.makedirs(monitor_path, exist_ok=True)
-            # Monitor用于记录训练过程中的奖励和额外信息
-            env_monitored = Monitor(env_raw, filename=monitor_path,
-                                    info_keywords=("unmet_this_step", "dispatch_records", "demands"))
-        else:
-            env_monitored = Monitor(env_raw, info_keywords=("unmet_this_step", "dispatch_records", "demands"))
+def make_ppo_env(seed=42, rank=0, log_dir_for_monitor_csv=None, version_tag="ppo_model", enable_monitor_logging=True):
+    def _init():
+        current_seed = seed + rank;
+        set_random_seed(current_seed)
+        env_raw = CarLogisticsEnv(seed=current_seed)
+        info_keywords_for_monitor = ("unmet_this_step", "dispatch_records", "demands")
+        monitor_filename = None
+        if enable_monitor_logging and log_dir_for_monitor_csv and version_tag:  # Ensure version_tag is also provided for path construction
+            monitor_path_base = os.path.join(log_dir_for_monitor_csv, version_tag, "monitor_logs_csv")
+            os.makedirs(monitor_path_base, exist_ok=True)
+            monitor_filename = os.path.join(monitor_path_base, f"monitor_rank_{rank}.csv")
+        env_monitored = Monitor(env_raw, filename=monitor_filename, info_keywords=info_keywords_for_monitor)
         return env_monitored
 
     return _init
 
 
-def train_model(model: PPO, env: VecNormalize, total_timesteps: int,
-                model_path: str, stats_path: str) -> None:
-    """
-    训练强化学习模型并保存。
+def run_ppo_experiment(
+        model_version_tag,  # Still used for organizing TensorBoard/Monitor logs if training occurs
+        training_seed,
+        eval_seed_start,
+        num_train_timesteps,
+        ppo_hyperparams,
+        log_root_dir_for_training_artifacts,  # For TB/Monitor logs if training
+        num_eval_episodes=100,
+        force_retrain=False,
+        num_parallel_envs=1
+):
+    print(f"\n--- 开始PPO模型实验 (日志版本标签: {model_version_tag}) ---")
+    print(f"PPO超参数: {ppo_hyperparams}")
+    print(f"训练步数: {num_train_timesteps}, 并行环境数: {num_parallel_envs}")
+    print(f"评估回合数: {num_eval_episodes}, 评估起始种子: {eval_seed_start}")
 
-    Args:
-        model (PPO): PPO模型实例。
-        env (VecNormalize): 归一化后的环境。
-        total_timesteps (int): 总训练步数。
-        model_path (str): 模型保存路径。
-        stats_path (str): 环境统计数据保存路径。
-    """
-    print(f"开始训练，目标步数: {total_timesteps}...")
-    start_time = time.time()
-    try:
-        model.learn(total_timesteps=total_timesteps, progress_bar=True)
-        model.save(model_path)
-        env.save(stats_path)
-        print("训练完成。模型和环境统计数据已保存。")
-    except KeyboardInterrupt:
-        model.save(model_path + "_interrupted")
-        env.save(stats_path + "_interrupted")
-        print("训练被中断。模型和环境统计数据已保存为中断版本。")
-    except Exception as e:
-        print(f"训练过程中发生错误: {e}")
-        model.save(model_path + "_error")
-        env.save(stats_path + "_error")
-    end_time = time.time()
-    print(f"训练耗时 {end_time - start_time:.2f} 秒.")
+    # MODIFIED: Define fixed model paths
+    FIXED_MODEL_DIR = "./model/"
+    FIXED_MODEL_FILENAME = os.path.join(FIXED_MODEL_DIR, "model.zip")
+    FIXED_STATS_FILENAME = os.path.join(FIXED_MODEL_DIR, "vecnormalize.pkl")
 
+    # Paths for TensorBoard and Monitor logs (still versioned if training occurs)
+    # These are only created if training_occurred is True.
+    current_experiment_training_artifacts_path = os.path.join(log_root_dir_for_training_artifacts, model_version_tag)
+    # current_experiment_tensorboard_log_dir # Defined if training_occurred
+    # Monitor log path will be constructed inside make_ppo_env if needed
 
-def evaluate_model(model_path: str, stats_path: str, num_eval_episodes: int = 1,
-                   monitor_log_root: Optional[str] = None) -> None:
-    """
-    评估训练好的模型，并生成详细的报告Excel文件。
+    train_env = None
+    training_occurred = False
 
-    Args:
-        model_path (str): 模型文件路径。
-        stats_path (str): 环境统计数据文件路径。
-        num_eval_episodes (int): 评估回合数。
-        monitor_log_root (Optional[str]): 评估日志保存目录 (可选，用于make_env)。
-    """
-    if not (os.path.exists(model_path) and os.path.exists(stats_path)):
-        print(f"在 {model_path} 或 {stats_path} 未找到模型/统计文件用于评估。")
+    # Determine if training is needed
+    if not force_retrain and os.path.exists(FIXED_MODEL_FILENAME) and os.path.exists(FIXED_STATS_FILENAME):
+        print(f"\n找到固定的预训练模型文件:\n  Model: {FIXED_MODEL_FILENAME}\n  Stats: {FIXED_STATS_FILENAME}")
+        print("将加载此模型并跳过训练。")
+        model_to_load_for_eval = FIXED_MODEL_FILENAME
+        stats_to_load_for_eval = FIXED_STATS_FILENAME
+    else:
+        training_occurred = True
+        if force_retrain:
+            print(f"\n强制重新训练模型...")
+        elif not (os.path.exists(FIXED_MODEL_FILENAME) and os.path.exists(FIXED_STATS_FILENAME)):
+            print(f"\n未在固定路径 {FIXED_MODEL_DIR} 找到模型，开始训练新模型...")
+        else:  # Should not happen if logic is correct, but as a fallback
+            print(f"\n开始训练新模型 (可能是因为一个文件丢失或未知原因)...")
+
+        # Create directories for training artifacts (logs, etc.) and the fixed model path
+        print(f"为训练日志创建根目录 (如果尚不存在): {log_root_dir_for_training_artifacts}")
+        os.makedirs(log_root_dir_for_training_artifacts, exist_ok=True)
+
+        print(f"为当前实验的训练日志创建目录: {current_experiment_training_artifacts_path}")
+        # current_experiment_model_dir is now FIXED_MODEL_DIR for model saving
+        os.makedirs(FIXED_MODEL_DIR, exist_ok=True)  # Ensure ./model directory exists for saving
+
+        current_experiment_tensorboard_log_dir = os.path.join(current_experiment_training_artifacts_path,
+                                                              "tensorboard_logs")
+        os.makedirs(current_experiment_tensorboard_log_dir, exist_ok=True)
+
+        # Monitor logs will be under current_experiment_training_artifacts_path/model_version_tag/monitor_logs_csv
+        # log_dir_for_monitor_csv passed to make_ppo_env will be current_experiment_training_artifacts_path
+
+        if num_parallel_envs > 1:
+            env_fns = [make_ppo_env(seed=training_seed, rank=i,
+                                    log_dir_for_monitor_csv=current_experiment_training_artifacts_path,
+                                    version_tag=model_version_tag, enable_monitor_logging=True) for i in
+                       range(num_parallel_envs)]
+            train_env_vec = SubprocVecEnv(env_fns, start_method='spawn')
+        else:
+            train_env_vec = DummyVecEnv([make_ppo_env(seed=training_seed, rank=0,
+                                                      log_dir_for_monitor_csv=current_experiment_training_artifacts_path,
+                                                      version_tag=model_version_tag, enable_monitor_logging=True)])
+
+        train_env = VecNormalize(train_env_vec, norm_obs=False, norm_reward=True, clip_reward=10.0,
+                                 gamma=ppo_hyperparams.get('gamma', 0.99))
+        model = PPO("MlpPolicy", train_env, verbose=1, tensorboard_log=current_experiment_tensorboard_log_dir,
+                    seed=training_seed, **ppo_hyperparams)
+        start_train_time = time.time()
+        try:
+            model.learn(total_timesteps=num_train_timesteps, progress_bar=True)
+            # MODIFIED: Save to fixed model paths
+            model.save(FIXED_MODEL_FILENAME)
+            train_env.save(FIXED_STATS_FILENAME)
+            print(f"PPO模型训练完成并保存到 {FIXED_MODEL_DIR}。耗时: {(time.time() - start_train_time) / 60:.2f} 分钟。")
+            model_to_load_for_eval = FIXED_MODEL_FILENAME  # For subsequent evaluation
+            stats_to_load_for_eval = FIXED_STATS_FILENAME
+        except Exception as e:
+            print(f"PPO模型训练过程中发生错误: {e}")
+            # Attempt to save to fixed path even on error, if model object exists
+            if 'model' in locals() and model is not None: model.save(FIXED_MODEL_FILENAME + "_error")
+            if train_env is not None: train_env.save(FIXED_STATS_FILENAME + "_error")
+            import traceback;
+            traceback.print_exc()
+            if train_env is not None: train_env.close()
+            return
+        finally:
+            if train_env is not None:  # Close train_env whether training succeeded or failed
+                train_env.close();
+                print("训练环境已关闭。")
+
+    if training_occurred:
+        print(f"训练日志 (TensorBoard, Monitor CSV) 保存在: {current_experiment_training_artifacts_path}")
+    else:
+        print(f"由于加载了现有模型 {FIXED_MODEL_FILENAME}，未生成新的训练日志目录。")
+
+    print(f"\n--- 正在评估模型 (从 {model_to_load_for_eval} 加载) ---")
+    if not (os.path.exists(model_to_load_for_eval) and os.path.exists(stats_to_load_for_eval)):
+        print(f"错误：未能找到模型 '{model_to_load_for_eval}' 或统计 '{stats_to_load_for_eval}' 进行评估。");
         return
 
-    print(f"\n--- 正在评估来自 {model_path} 的训练模型 ---")
+    eval_env_vec_for_loading_stats = None
+    eval_env = None
+    all_episodes_summary_data = []
+    master_dispatch_log_records = []
+    master_demand_log_records = []
+    first_episode_distances_for_report = None
 
-    # 创建评估环境，确保不记录Monitor日志以避免干扰训练日志
-    eval_env_callable = make_env(seed=123, rank=0, log_dir=monitor_log_root)
-    eval_env_vec = DummyVecEnv([eval_env_callable])
+    try:
+        eval_env_vec_for_loading_stats = DummyVecEnv(
+            [make_ppo_env(seed=training_seed, rank=0, log_dir_for_monitor_csv=None,
+                          version_tag=model_version_tag + "_eval_temp_load", enable_monitor_logging=False)])
+        eval_env = VecNormalize.load(stats_to_load_for_eval, eval_env_vec_for_loading_stats)
+        eval_env.training = False;
+        eval_env.norm_reward = False
+        model_to_eval = PPO.load(model_to_load_for_eval, env=eval_env)
 
-    # 加载环境统计数据，并设置评估模式
-    eval_env = VecNormalize.load(stats_path, eval_env_vec)
-    eval_env.training = False  # 关闭训练模式
-    eval_env.norm_reward = False  # 评估时不归一化奖励
-
-    # 加载模型
-    model_to_eval = PPO.load(model_path, env=eval_env)
-
-    total_reward_eval = 0.0
-
-    for episode in range(num_eval_episodes):
-        obs, _ = eval_env.reset()
-        terminated = np.array([False])
-        truncated = np.array([False])
-        episode_reward = 0.0
-        unmet_total_year = 0
-        current_week_in_year = 0
-        yearly_dispatch_log: List[Dict] = []
-        yearly_demand_log: List[Dict] = []
-
-        print(f"\n--- 评估年 {episode + 1} ---")
-        while not (terminated[0] or truncated[0]):
-            action, _states = model_to_eval.predict(obs, deterministic=True)
-            obs, reward, dones, infos = eval_env.step(action)
-            terminated = dones
-            # 兼容不同版本的gymnasium TimeLimitWrapper
-            truncated_info = infos[0].get("TimeLimit.truncated", False)
-            truncated[0] = truncated_info if isinstance(truncated_info, bool) else truncated_info.item()
-
-            episode_reward += reward[0]
-            unmet_total_year += infos[0].get('unmet_this_step', 0)
-            current_week_in_year = infos[0].get('current_week', 0)
-            yearly_dispatch_log.extend(infos[0].get('dispatch_records', []))
-
-            # 收集当周需求
-            current_week_demands_info = infos[0].get('demands', {})
-            if current_week_demands_info:
-                # 遍历大客户需求
-                for lc_idx, lc_demand in enumerate(current_week_demands_info.get('LC', [])):
-                    for car_type, qty in lc_demand.items():
-                        yearly_demand_log.append({
-                            'week': current_week_in_year,
-                            'customer_type': '大客户',
-                            'customer_id': LARGE_CUSTOMERS[lc_idx],
-                            'car_type': car_type,
-                            'demand_qty': qty
-                        })
-                # 遍历4S店需求
-                for s4_idx, s4_demand in enumerate(current_week_demands_info.get('4S', [])):
-                    for car_type, qty in s4_demand.items():
-                        yearly_demand_log.append({
-                            'week': current_week_in_year,
-                            'customer_type': '4S店',
-                            'customer_id': S4_STORES[s4_idx],
-                            'car_type': car_type,
-                            'demand_qty': qty
-                        })
-                # 遍历经销商需求
-                for dlr_idx, dlr_demand in enumerate(current_week_demands_info.get('Dealer', [])):
-                    for car_type, qty in dlr_demand.items():
-                        yearly_demand_log.append({
-                            'week': current_week_in_year,
-                            'customer_type': '经销商',
-                            'customer_id': DEALERS[dlr_idx],
-                            'car_type': car_type,
-                            'demand_qty': qty
-                        })
-
-            # 每10周或回合结束时打印摘要
-            if (current_week_in_year % 10 == 0 and current_week_in_year > 0) or terminated[0] or truncated[0]:
-                print(
-                    f"  周: {current_week_in_year:<3}, 当周奖励: {reward[0]:<8.2f}, 年累计奖励: {episode_reward:<10.2f}, 当周未满足: {infos[0].get('unmet_this_step', 0)}"
-                )
-                monitor_episode_info = infos[0].get('episode')
-                if (terminated[0] or truncated[0]) and monitor_episode_info:
+        for episode in range(num_eval_episodes):
+            current_eval_seed = eval_seed_start + episode;
+            eval_env.seed(current_eval_seed)
+            obs = eval_env.reset()
+            terminated, truncated = np.array([False]), np.array([False])
+            episode_reward_sum_raw, episode_unmet_total = 0.0, 0
+            is_first_step_of_episode = True;
+            current_week_in_year = 0
+            print(
+                f"\n--- 评估年 {episode + 1}/{num_eval_episodes} (种子: {current_eval_seed}) ---")  # Removed model_version_tag from here for brevity
+            while not (terminated[0] or truncated[0]):
+                action, _ = model_to_eval.predict(obs, deterministic=True)
+                obs, reward, dones, infos = eval_env.step(action)
+                terminated, truncated = dones, infos[0].get("TimeLimit.truncated", np.array([False])) if isinstance(
+                    infos[0].get("TimeLimit.truncated", False), np.ndarray) else np.array(
+                    [infos[0].get("TimeLimit.truncated", False)])
+                episode_reward_sum_raw += reward[0];
+                episode_unmet_total += infos[0].get('unmet_this_step', 0)
+                current_week_in_year = infos[0].get('current_week', 0)
+                if is_first_step_of_episode:
+                    if first_episode_distances_for_report is None: first_episode_distances_for_report = infos[0].get(
+                        'distances', {})
+                    is_first_step_of_episode = False
+                current_episode_dispatch_records = infos[0].get('dispatch_records', [])
+                for record_d in current_episode_dispatch_records: record_d[
+                    '评估年份'] = episode + 1; master_dispatch_log_records.append(record_d)
+                demands_info = infos[0].get('demands', {})
+                if demands_info:
+                    temp_demand_records_this_step = []
+                    for lc_idx, lc_demand in enumerate(demands_info.get('LC', [])):
+                        for ct_key, qty in lc_demand.items(): temp_demand_records_this_step.append(
+                            {'评估年份': episode + 1, 'week': current_week_in_year, 'customer_type': '大客户',
+                             'customer_id': LARGE_CUSTOMERS[lc_idx], 'car_type': ct_key, 'demand_qty': qty})
+                    for s4_idx, s4_demand in enumerate(demands_info.get('4S', [])):
+                        for ct_key, qty in s4_demand.items(): temp_demand_records_this_step.append(
+                            {'评估年份': episode + 1, 'week': current_week_in_year, 'customer_type': '4S店',
+                             'customer_id': S4_STORES[s4_idx], 'car_type': ct_key, 'demand_qty': qty})
+                    for dlr_idx, dlr_demand in enumerate(demands_info.get('Dealer', [])):
+                        for ct_key, qty in dlr_demand.items(): temp_demand_records_this_step.append(
+                            {'评估年份': episode + 1, 'week': current_week_in_year, 'customer_type': '经销商',
+                             'customer_id': DEALERS[dlr_idx], 'car_type': ct_key, 'demand_qty': qty})
+                    master_demand_log_records.extend(temp_demand_records_this_step)
+                if (
+                        current_week_in_year % 26 == 0 and current_week_in_year > 0 and current_week_in_year <= NUM_WEEKS_PER_YEAR) or \
+                        terminated[0] or truncated[0]:
                     print(
-                        f"    Monitor回合信息 - 奖励: {monitor_episode_info['r']:.2f}, 长度: {monitor_episode_info['l']}, 时间: {monitor_episode_info['t']:.2f}s"
-                    )
+                        f"  年 {episode + 1}, 周: {current_week_in_year:<3}, 当周奖励: {reward[0]:<8.2f}, 年累计奖励: {episode_reward_sum_raw:<10.2f}, 当周未满足: {infos[0].get('unmet_this_step', 0)}")
+            episode_total_transport_cost_from_log = sum(
+                d['cost'] for d in master_dispatch_log_records if d.get('评估年份') == episode + 1 and 'cost' in d)
+            all_episodes_summary_data.append(
+                {'评估年份': episode + 1, '随机种子': current_eval_seed, '年度总奖励': round(episode_reward_sum_raw, 2),
+                 '全年未满足需求总量': episode_unmet_total,
+                 '总运输成本(调度日志)': round(episode_total_transport_cost_from_log, 2)})
+            print(
+                f"评估年 {episode + 1} 结束。奖励: {episode_reward_sum_raw:.2f}, 未满足: {episode_unmet_total}, 运输成本: {episode_total_transport_cost_from_log:.2f}")
 
-        print(f"评估年 {episode + 1} 结束. 总奖励: {episode_reward:.2f}, 全年未满足需求总量: {unmet_total_year}")
-
-        # 导出评估报告到Excel
-        excel_filename_summary = f"评估报告_第{episode + 1}年.xlsx"
-        try:
-            with pd.ExcelWriter(excel_filename_summary, engine='openpyxl') as writer:
-                # 调度日志
-                if yearly_dispatch_log:
-                    df_year_dispatch = pd.DataFrame(yearly_dispatch_log)
-                    column_name_mapping_cn_dispatch = {
-                        'week': '周次', 'type': '调度类型', 'car_type': '车型', 'quantity': '数量',
-                        'source': '来源地', 'destination': '目的地', 'reason': '原因/备注', 'cost': '运输成本'
-                    }
-                    df_year_dispatch_cn = df_year_dispatch.rename(columns=column_name_mapping_cn_dispatch)
-                    df_year_dispatch_cn.to_excel(writer, sheet_name='调度日志', index=False)
-                    print("  调度日志已写入Excel。")
-
-                # 每周需求
-                if yearly_demand_log:
-                    df_year_demand = pd.DataFrame(yearly_demand_log)
-                    demand_column_mapping_cn = {
-                        'week': '周次', 'customer_type': '客户类型', 'customer_id': '客户ID',
-                        'car_type': '车型', 'demand_qty': '需求量'
-                    }
-                    df_year_demand_cn = df_year_demand.rename(columns=demand_column_mapping_cn)
-                    df_year_demand_cn.to_excel(writer, sheet_name='每周需求', index=False)
-                    print("  每周需求已写入Excel。")
-
-                # 获取原始环境实例以访问距离数据
-                original_env_instance = eval_env.envs[0].env
-                if hasattr(original_env_instance, 'distances') and original_env_instance.distances:
-                    distances_list = []
-                    for (loc1, loc2), dist_val in original_env_instance.distances.items():
-                        # 只添加一次 (loc1, loc2) 和 (loc2, loc1) 的配对，避免重复
-                        if loc1 < loc2:  # 确保顺序，避免重复，例如(A,B)和(B,A)只记录一次
-                            distances_list.append({'地点1': loc1, '地点2': loc2, '距离_km': dist_val})
-                    if distances_list:
-                        df_distances = pd.DataFrame(distances_list)
-                        df_distances.to_excel(writer, sheet_name='地点距离', index=False)
-                        print("  地点距离已写入Excel。")
-
-                # 单位运输成本
-                df_transport_costs = pd.DataFrame(list(TRANSPORT_COST_PER_KM.items()),
-                                                  columns=['车型', '单位运输成本_每公里'])
-                df_transport_costs.to_excel(writer, sheet_name='单位运输成本', index=False)
-                print("  单位运输成本已写入Excel。")
-
-            print(f"评估报告已导出到: {excel_filename_summary}")
-        except ImportError:
-            print("无法导出到Excel，请安装 'openpyxl' 库。")
-        except Exception as e:
-            print(f"导出到Excel时发生错误: {e}")
-
-        total_reward_eval += episode_reward
-
-    print(f"\n{num_eval_episodes} 个评估年的平均奖励: {total_reward_eval / num_eval_episodes:.2f}")
-    eval_env.close()
+        # MODIFIED: Excel filename is fixed
+        excel_filename_summary = f"./评估报告100年汇总.xlsx"  # Removed model_version_tag and num_eval_episodes from here
+        print(f"\n正在生成汇总Excel报告: {excel_filename_summary}")
+        with pd.ExcelWriter(excel_filename_summary, engine='openpyxl') as writer:
+            df_yearly_summary = pd.DataFrame(all_episodes_summary_data)
+            df_yearly_summary.to_excel(writer, sheet_name=f'{num_eval_episodes}年汇总统计', index=False);
+            print(f"  {num_eval_episodes}年汇总统计已写入。")
+            if not df_yearly_summary.empty:
+                avg_data = {'指标': ['平均年度总奖励', '平均全年未满足需求总量', '平均总运输成本(调度日志)'],
+                            '平均值': [round(df_yearly_summary['年度总奖励'].mean(), 2),
+                                       round(df_yearly_summary['全年未满足需求总量'].mean(), 2),
+                                       round(df_yearly_summary['总运输成本(调度日志)'].mean(), 2)]}
+                pd.DataFrame(avg_data).to_excel(writer, sheet_name='平均统计', index=False);
+                print(f"  平均统计已写入。")
+            if master_dispatch_log_records:
+                df_master_dispatch = pd.DataFrame(master_dispatch_log_records);
+                cols = ['评估年份'] + [col for col in df_master_dispatch.columns if col != '评估年份'];
+                df_master_dispatch = df_master_dispatch[cols]
+                col_map_dispatch = {'week': '周次', 'type': '调度类型', 'car_type': '车型', 'quantity': '数量',
+                                    'source': '来源地', 'destination': '目的地', 'reason': '原因/备注',
+                                    'cost': '运输成本'}
+                df_master_dispatch.rename(columns=col_map_dispatch).to_excel(writer, sheet_name='调度日志汇总',
+                                                                             index=False);
+                print(f"  调度日志汇总已写入。")
+            if master_demand_log_records:
+                df_master_demand = pd.DataFrame(master_demand_log_records);
+                cols = ['评估年份'] + [col for col in df_master_demand.columns if col != '评估年份'];
+                df_master_demand = df_master_demand[cols]
+                col_map_demand = {'week': '周次', 'customer_type': '客户类型', 'customer_id': '客户ID',
+                                  'car_type': '车型', 'demand_qty': '需求量'}
+                df_master_demand.rename(columns=col_map_demand).to_excel(writer, sheet_name='每周需求汇总',
+                                                                         index=False);
+                print(f"  每周需求汇总已写入。")
+            if first_episode_distances_for_report:
+                distances_list = [];
+                processed_pairs = set();
+                sorted_dist_items = sorted(first_episode_distances_for_report.items())
+                for (loc1, loc2), dist_val in sorted_dist_items:
+                    pair = tuple(sorted((loc1, loc2)))
+                    if loc1 != loc2 and pair not in processed_pairs: distances_list.append(
+                        {'地点1': loc1, '地点2': loc2, '距离_km': dist_val}); processed_pairs.add(pair)
+                if distances_list: pd.DataFrame(distances_list).to_excel(writer, sheet_name='地点距离',
+                                                                         index=False); print(f"  地点距离已写入。")
+            pd.DataFrame(list(TRANSPORT_COST_PER_KM.items()), columns=['车型', '单位运输成本_每公里']).to_excel(writer,
+                                                                                                                sheet_name='单位运输成本',
+                                                                                                                index=False);
+            print(f"  单位运输成本已写入。")
+        print(f"评估报告已导出到: {excel_filename_summary}")
+    except Exception as e_eval:
+        print(f"评估或生成报告时发生错误: {e_eval}"); import \
+            traceback; traceback.print_exc()  # Removed model_version_tag from error msg
+    finally:
+        if eval_env is not None: eval_env.close(); print("评估环境(VecNormalize)已关闭。")
+        if eval_env_vec_for_loading_stats is not None and eval_env_vec_for_loading_stats != eval_env: eval_env_vec_for_loading_stats.close(); print(
+            "用于加载统计的临时评估环境(DummyVecEnv)已关闭。")
+    print(f"\n--- 实验执行完毕 (日志版本标签: {model_version_tag}) ---")
 
 
 if __name__ == "__main__":
-    # 配置路径
-    MONITOR_LOG_ROOT = "./monitor_logs_full_report/"
-    MODEL_PATH = "ppo_car_logistics_full_report.zip"
-    STATS_PATH = "vec_normalize_stats_full_report.pkl"
-    TENSORBOARD_LOG_PATH = "./ppo_logistics_tensorboard_full_report/"
-    TOTAL_TIMESTEPS = 100000  # 训练总步数
+    LOG_ROOT_FOR_TRAINING_ARTIFACTS = "./ppo_logistics_training_artifacts/"
 
-    os.makedirs(MONITOR_LOG_ROOT, exist_ok=True)
-    os.makedirs(TENSORBOARD_LOG_PATH, exist_ok=True)  # 确保TensorBoard日志目录存在
+    try:
+        num_cpus = multiprocessing.cpu_count()
+        num_parallel_training_envs = min(num_cpus, 8) if num_cpus > 1 else 1
+        print(f"检测到 {num_cpus} CPU核心。将用 {num_parallel_training_envs} 个并行环境训练。")
+    except NotImplementedError:
+        print("无法检测CPU核心数。默认用1个并行环境。")
+        num_parallel_training_envs = 1
 
-    # 1. 环境初始化
-    env_callable = make_env(seed=42, rank=0, log_dir=MONITOR_LOG_ROOT)
-    env_vec = DummyVecEnv([env_callable])
-    # VecNormalize 用于观测值和奖励的归一化，有助于RL模型训练
-    env = VecNormalize(env_vec, norm_obs=True, norm_reward=True, clip_reward=10.0, gamma=0.99)
+    # model_version_tag is now primarily for versioning training logs (TB, Monitor CSV)
+    # if training occurs. The main model and Excel report have fixed names/paths.
+    CURRENT_MODEL_VERSION_TAG = "PPO_Logistics_Run_Default"
+    ORIGINAL_TRAINING_SEED = 789
+    ORIGINAL_EVAL_SEED_START = 2000
+    ORIGINAL_TRAIN_STEPS = 150000
 
-    # 2. 模型加载或新建
-    model: PPO
-    if os.path.exists(MODEL_PATH) and os.path.exists(STATS_PATH):
-        print("加载预训练模型和统计数据...")
-        # 为了加载VecNormalize的统计数据，需要一个空的DummyVecEnv
-        env_to_load_stats_callable = make_env(seed=42, rank=0, log_dir=MONITOR_LOG_ROOT)
-        env_to_load_stats_vec = DummyVecEnv([env_to_load_stats_callable])
-        env = VecNormalize.load(STATS_PATH, env_to_load_stats_vec)
-        env.training = True  # 确保加载后设置为训练模式
-        model = PPO.load(MODEL_PATH, env=env)
-    else:
-        print("未找到预训练模型。正在训练新模型...")
-        model = PPO("MlpPolicy", env, verbose=1, learning_rate=3e-4, n_steps=2048, batch_size=64, n_epochs=10,
-                    gamma=0.99, gae_lambda=0.95, clip_range=0.2, ent_coef=0.0,
-                    tensorboard_log=TENSORBOARD_LOG_PATH)
+    ORIGINAL_PPO_HYPERPARAMS = {
+        'learning_rate': 1e-3, 'n_steps': 512, 'batch_size': 32, 'n_epochs': 5,
+        'gamma': 0.98, 'gae_lambda': 0.92, 'clip_range': 0.3, 'vf_coef': 0.6,
+        'ent_coef': 0.01, 'policy_kwargs': dict(net_arch=dict(pi=[64, 64], vf=[64, 64]))
+    }
 
-    # 3. 训练模型
-    train_model(model, env, TOTAL_TIMESTEPS, MODEL_PATH, STATS_PATH)
-    env.close()  # 训练环境关闭
+    run_ppo_experiment(
+        model_version_tag=CURRENT_MODEL_VERSION_TAG,  # Used for log subdirs if training
+        training_seed=ORIGINAL_TRAINING_SEED,
+        eval_seed_start=ORIGINAL_EVAL_SEED_START,
+        num_train_timesteps=ORIGINAL_TRAIN_STEPS,
+        ppo_hyperparams=ORIGINAL_PPO_HYPERPARAMS,
+        log_root_dir_for_training_artifacts=LOG_ROOT_FOR_TRAINING_ARTIFACTS,
+        num_eval_episodes=100,
+        force_retrain=False,
+        num_parallel_envs=num_parallel_training_envs
+    )
 
-    # 4. 评估模型
-    evaluate_model(MODEL_PATH, STATS_PATH, num_eval_episodes=2)  # 评估2年
+    print(f"\n--- 所有实验执行完毕 ---")
+    print(f"训练模型保存在 './model/' 目录下。")
+    print(f"TensorBoard和Monitor日志保存在 '{LOG_ROOT_FOR_TRAINING_ARTIFACTS}' 下的对应版本子目录中。")
+    print(f"最终的Excel汇总报告 '{'评估报告100年汇总.xlsx'}' 直接保存在脚本根目录下。")
