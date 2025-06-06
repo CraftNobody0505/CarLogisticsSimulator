@@ -14,7 +14,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 # =============================================================================
 # 文件: car_logistics_env.py
-# 作者: [你的名字]
+# 作者: [Neo]
 # 日期: 2023-10-27
 # 描述: 基于Gymnasium的汽车物流模拟环境，用于强化学习决策。
 #       模拟汽车从工厂、仓库到客户和经销商的调度与运输过程，目标是最小化总成本。
