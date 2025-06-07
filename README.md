@@ -74,5 +74,5 @@
 
 ## 🪄 项目展示地址
 
-> GitHub 项目地址：[https://github.com/你的用户名/你的项目名](https://github.com/CraftNobody0505/CarLogisticsSimulator)  
+> GitHub 项目地址：(https://github.com/CraftNobody0505/CarLogisticsSimulator)  
 > 欢迎 star / fork / 合作开发
